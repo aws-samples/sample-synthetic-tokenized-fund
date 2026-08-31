@@ -30,6 +30,8 @@ contract PriceFeed is IReceiver {
     error NotForwarder();
     error ZeroAddress();
     error ReportTooShort();
+    error InvalidPrice();
+    error StaleTimestamp();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -52,7 +54,19 @@ contract PriceFeed is IReceiver {
 
     /// @notice Writes a new (price, timestamp) pair. Restricted to the configured
     ///         forwarder so only DON-signed reports can mutate state.
+    /// @dev Validates the report so a malformed or out-of-order delivery cannot poison the feed:
+    ///      the price must be non-zero, and it cannot move backwards in time (monotonic),
+    ///      preventing a replayed/stale report from overwriting fresher data. A timestamp ahead of
+    ///      the current block is CLAMPED to `block.timestamp` rather than rejected: the DON/data
+    ///      timestamp can run slightly ahead of chain time due to clock skew, and reverting would
+    ///      stall the feed. Clamping still guarantees a stored timestamp is never in the future, so
+    ///      a consumer's `block.timestamp - timestamp` staleness check can never underflow.
     function updatePrice(uint256 _price, uint256 _timestamp) public onlyForwarder {
+        if (_price == 0) revert InvalidPrice();
+        if (_timestamp > block.timestamp) {
+            _timestamp = block.timestamp;
+        }
+        if (_timestamp < latestPrice.timestamp) revert StaleTimestamp();
         latestPrice = PriceData(_price, _timestamp);
         emit PriceUpdated(_price, _timestamp);
     }

@@ -29,13 +29,26 @@ load_addresses() {
         SYNTHETIC_MINTER=$(jq -r '.evms[0].syntheticMinterAddress' "$CRE_CONFIG")
         SYNTHETIC_TOKEN=$(jq -r '.evms[0].syntheticTokenAddress' "$CRE_CONFIG")
         PRICE_FEED=$(jq -r '.evms[0].priceFeedAddress' "$CRE_CONFIG")
-        USDC="0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+        USDC="${USDC_ADDRESS:-0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238}"
     else
-        SYNTHETIC_MINTER="0x2B979fb42ef0501AD090923B40d3467FC9b2C3E6"
-        SYNTHETIC_TOKEN="0x7AB0e63EAd88785625E33F2DC04003f143b01450"
-        PRICE_FEED="0xdc87A131b53385437ea70396DdB7Dc6BA9627022"
-        USDC="0x1c7D4B196Cb0C7B01d743Fbc6116a902379C7238"
+        echo -e "${RED}Error: No deployed contract addresses found.${NC}" >&2
+        echo "Expected one of:" >&2
+        echo "  - $DEPLOYED_ADDRESSES" >&2
+        echo "  - $CRE_CONFIG" >&2
+        echo "" >&2
+        echo "Deploy the contracts first with ./deploy-e2e.sh, then re-run this test." >&2
+        exit 1
     fi
+
+    # Guard against partially-populated / zero-address config
+    for pair in "SyntheticMinter:$SYNTHETIC_MINTER" "SyntheticToken:$SYNTHETIC_TOKEN" "PriceFeed:$PRICE_FEED" "USDC:$USDC"; do
+        name="${pair%%:*}"
+        addr="${pair#*:}"
+        if [ -z "$addr" ] || [ "$addr" = "null" ] || [ "$addr" = "0x0000000000000000000000000000000000000000" ]; then
+            echo -e "${RED}Error: $name address is missing or zero. Redeploy with ./deploy-e2e.sh.${NC}" >&2
+            exit 1
+        fi
+    done
 }
 
 RPC_URL="${RPC_URL:-https://ethereum-sepolia-rpc.publicnode.com}"

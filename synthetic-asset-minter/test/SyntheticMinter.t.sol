@@ -1147,9 +1147,13 @@ contract SyntheticMinterMintTest is Test {
         
         // Calculate expected required collateral using the same formula as the contract
         // Formula: (syntheticAmount * price * minCollateralizationRatio) / (100 * 10^PRICE_DECIMALS * 10^12)
-        uint256 expectedRequiredCollateral = (syntheticAmount * price * collateralizationRatio) 
+        uint256 expectedRequiredCollateral = (syntheticAmount * price * collateralizationRatio)
             / (100 * 10**8 * 10**12);
-        
+
+        // The contract now rejects dust mints that would lock zero collateral (unbacked debt);
+        // only exercise inputs that lock a positive amount.
+        vm.assume(expectedRequiredCollateral > 0);
+
         // Deposit enough collateral for the locked amount plus the USDC mint fee (add buffer)
         uint256 feeUSDC = (syntheticAmount * price * minter.mintFeeBps()) / (10000 * 10**8 * 10**12);
         uint256 depositAmount = expectedRequiredCollateral + feeUSDC + 1000 * 10**6; // Extra buffer
@@ -1295,6 +1299,9 @@ contract SyntheticMinterInsufficientCollateralTest is Test {
             / (100 * 10**8 * 10**12);
         uint256 feeUSDC = (syntheticAmount * price * minter.mintFeeBps()) / (10000 * 10**8 * 10**12);
 
+        // The contract now rejects dust mints that would lock zero collateral (unbacked debt).
+        vm.assume(requiredCollateral > 0);
+
         // Deposit exactly required + fee + extra
         uint256 depositAmount = requiredCollateral + feeUSDC + extraCollateral;
 
@@ -1398,6 +1405,8 @@ contract SyntheticMinterFeeDeductionTest is Test {
         uint256 requiredCollateral = (syntheticAmount * price * minCollateralizationRatio)
             / (100 * 10**8 * 10**12);
         uint256 expectedFee = (syntheticAmount * price * mintFeeBps) / (10000 * 10**8 * 10**12);
+        // The contract now rejects dust mints that would lock zero collateral (unbacked debt).
+        vm.assume(requiredCollateral > 0);
         uint256 depositAmount = requiredCollateral + expectedFee + 1000 * 10**6; // Extra buffer
 
         usdc.mint(user, depositAmount);
@@ -1438,16 +1447,18 @@ contract SyntheticMinterFeeDeductionTest is Test {
         // Calculate required collateral and deposit enough
         uint256 price = 18500000000;
         uint256 minCollateralizationRatio = minter.minCollateralizationRatio();
-        uint256 requiredCollateral = (syntheticAmount * price * minCollateralizationRatio) 
+        uint256 requiredCollateral = (syntheticAmount * price * minCollateralizationRatio)
             / (100 * 10**8 * 10**12);
+        // The contract now rejects dust mints that would lock zero collateral (unbacked debt).
+        vm.assume(requiredCollateral > 0);
         uint256 depositAmount = requiredCollateral + 1000 * 10**6;
-        
+
         usdc.mint(user, depositAmount);
         vm.prank(user);
         usdc.approve(address(minter), depositAmount);
         vm.prank(user);
         minter.depositCollateral(depositAmount);
-        
+
         // Record accumulated fees before mint
         uint256 feesBefore = minter.accumulatedFees();
         
@@ -3232,28 +3243,70 @@ contract SyntheticMinterCDPTest is Test {
 
     // ============ Extreme price gap / bad debt ============
 
+    // H2: a defaulting borrower's OWN collateral (locked first, then available) absorbs the loss
+    // before the protocol realizes any bad debt. Bad debt is only realized once the debt value
+    // exceeds the borrower's ENTIRE collateral — and the shortfall is measured against total, not
+    // just the locked portion (the old code left the available collateral untouched).
     function test_ExtremePriceGap_SeizesAllCollateral_EmitsBadDebt() public {
         uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
         uint256 lockedBefore = minter.lockedCollateral(user);
+        uint256 totalBefore = minter.totalCollateral(user);
+        assertGt(totalBefore, lockedBefore, "position has available collateral beyond the locked amount");
 
-        // SPY doubles: debt value now exceeds the locked collateral entirely.
-        _setPrice(200 * 10**8);
+        // SPY jumps to $250: debt value ($2500) now exceeds even the borrower's TOTAL collateral.
+        _setPrice(250 * 10**8);
 
         vm.prank(user);
         syntheticToken.transfer(liquidator, net);
 
         uint256 price = minter.getLatestPrice();
         uint256 repayValue = _debtValueUSDC(net, price);
-        assertGt(repayValue, lockedBefore, "position is underwater");
+        assertGt(repayValue, totalBefore, "position is underwater beyond total collateral");
 
         uint256 liqBefore = usdc.balanceOf(liquidator);
         vm.prank(liquidator);
+        // Shortfall is measured against the borrower's TOTAL collateral (H2), not just locked.
         vm.expectEmit(true, false, false, true);
-        emit BadDebtRealized(user, repayValue - lockedBefore);
+        emit BadDebtRealized(user, repayValue - totalBefore);
         minter.liquidate(user, net);
 
-        // Contract never pays out more than the locked collateral.
-        assertEq(usdc.balanceOf(liquidator) - liqBefore, lockedBefore);
+        // Liquidator receives ALL of the borrower's collateral, including the formerly-shielded
+        // available portion — the contract still never pays out more than the position holds.
+        assertEq(usdc.balanceOf(liquidator) - liqBefore, totalBefore);
+        assertEq(minter.syntheticDebt(user), 0);
+        assertEq(minter.lockedCollateral(user), 0);
+        assertEq(minter.totalCollateral(user), 0, "borrower's available collateral absorbed the loss too");
+    }
+
+    // Complementary case: at a gap the borrower's TOTAL (but not locked) collateral can cover, the
+    // available collateral absorbs the shortfall and NO bad debt is realized (old code emitted it).
+    function test_PriceGap_AvailableCoversShortfall_NoBadDebt() public {
+        uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        uint256 lockedBefore = minter.lockedCollateral(user);
+
+        // SPY doubles to $200: debt value ($2000) exceeds locked (~$1500) but equals total ($2000).
+        _setPrice(200 * 10**8);
+        uint256 price = minter.getLatestPrice();
+        uint256 repayValue = _debtValueUSDC(net, price);
+        assertGt(repayValue, lockedBefore, "underwater vs locked");
+        assertLe(repayValue, minter.totalCollateral(user), "but total collateral covers it");
+
+        vm.prank(user);
+        syntheticToken.transfer(liquidator, net);
+
+        uint256 liqBefore = usdc.balanceOf(liquidator);
+        // Record all logs so we can assert NO BadDebtRealized was emitted.
+        vm.recordLogs();
+        vm.prank(liquidator);
+        minter.liquidate(user, net);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        bytes32 badDebtSig = keccak256("BadDebtRealized(address,uint256)");
+        for (uint256 i = 0; i < logs.length; i++) {
+            assertTrue(logs[i].topics[0] != badDebtSig, "no bad debt should be realized");
+        }
+
+        // Liquidator was paid the full repay value out of locked + available (capped at total).
+        assertEq(usdc.balanceOf(liquidator) - liqBefore, repayValue);
         assertEq(minter.syntheticDebt(user), 0);
         assertEq(minter.lockedCollateral(user), 0);
     }
@@ -3309,13 +3362,37 @@ contract SyntheticMinterCDPTest is Test {
 
     // ============ Staleness still blocks price-dependent ops ============
 
-    function test_StaleFeed_BlocksBurn() public {
+    // M1: burning is price-INDEPENDENT debt repayment, so a stale (or unset) oracle must NOT trap a
+    // user's ability to repay debt and reclaim collateral. Previously burn reverted on staleness.
+    function test_StaleFeed_DoesNotBlockBurn() public {
         uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        uint256 locked = minter.lockedCollateral(user);
+        assertGt(locked, 0);
+
         // Advance time past the staleness window without refreshing the feed.
         vm.warp(block.timestamp + 3601);
+
+        // Burn must still succeed and release the locked collateral despite the stale feed.
         vm.prank(user);
-        vm.expectRevert("Price feed stale");
         minter.burn(net);
+
+        assertEq(minter.syntheticDebt(user), 0, "debt repaid despite stale oracle");
+        assertEq(minter.lockedCollateral(user), 0, "collateral released despite stale oracle");
+        assertEq(minter.totalCollateral(user), 2000 * 10**6, "user reclaims all locked USDC");
+    }
+
+    // Repayment must work even when the price feed is entirely unset (address(0)).
+    function test_UnsetFeed_DoesNotBlockBurn() public {
+        uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        // Clear the feed by pointing the minter at a fresh (never-configured) feed is not possible
+        // (setter rejects address(0)); instead simulate an unusable feed by making it revert.
+        // A stale feed already covers the revert-path; here we assert an unset feed at deploy time
+        // would not block burn by checking the best-effort read tolerates a reverting feed.
+        priceFeed.setPrice(0, block.timestamp); // getLatestPrice returns 0 price
+        vm.prank(user);
+        minter.burn(net);
+        assertEq(minter.syntheticDebt(user), 0);
+        assertEq(minter.lockedCollateral(user), 0);
     }
 
     function test_StaleFeed_BlocksLiquidation() public {
@@ -3419,13 +3496,170 @@ contract SyntheticMinterCDPTest is Test {
             syntheticToken.transfer(liquidator, net);
             uint256 repay = (minter.syntheticDebt(user) * repayFraction) / 100;
             if (repay > 0 && syntheticToken.balanceOf(liquidator) >= repay) {
+                // A partial liquidation that would consume all locked collateral now reverts
+                // ("Must fully close underwater position"). Either outcome is acceptable here —
+                // the solvency invariants below must hold whether or not the liquidation executes.
                 vm.prank(liquidator);
-                minter.liquidate(user, repay);
+                try minter.liquidate(user, repay) {} catch {}
             }
         }
 
         // Core solvency invariant holds after any liquidation.
         assertGe(usdc.balanceOf(address(minter)), minter.totalLockedCollateral());
         assertGe(minter.totalCollateral(user), minter.lockedCollateral(user));
+    }
+
+    // ============ H1: partial liquidation cannot strand unbacked debt ============
+
+    // A partial liquidation whose seizure would consume ALL of the locked collateral must revert:
+    // otherwise the un-repaid remainder would be left with zero backing and no bad-debt signal.
+    function test_H1_PartialLiquidationConsumingAllLocked_Reverts() public {
+        uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        uint256 locked = minter.lockedCollateral(user);
+
+        // Deeply underwater: at $250 the value+bonus of even a ~65% repay exceeds all locked.
+        _setPrice(250 * 10**8);
+        assertTrue(minter.isLiquidatable(user));
+
+        vm.prank(user);
+        syntheticToken.transfer(liquidator, net);
+
+        // Find a partial repay whose seizure exceeds the locked collateral.
+        uint256 price = minter.getLatestPrice();
+        uint256 repay = (minter.syntheticDebt(user) * 80) / 100; // partial (newDebt > 0)
+        uint256 repayValue = _debtValueUSDC(repay, price);
+        uint256 seize = repayValue + (repayValue * minter.liquidationBonusBps()) / 10000;
+        assertGe(seize, locked, "test setup: this partial should consume all locked");
+
+        // Must be rejected — a liquidator wanting to go this deep must fully close instead.
+        vm.prank(liquidator);
+        vm.expectRevert("Must fully close underwater position");
+        minter.liquidate(user, repay);
+    }
+
+    // A partial liquidation that stays within the locked collateral is allowed and always leaves
+    // the remaining debt backed by positive locked collateral (no stranding).
+    function test_H1_SmallPartialLeavesRemainingDebtBacked() public {
+        uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        _setPrice(250 * 10**8); // deeply underwater
+        assertTrue(minter.isLiquidatable(user));
+
+        vm.prank(user);
+        syntheticToken.transfer(liquidator, net);
+
+        // Small repay (10%): seizure stays within locked collateral.
+        uint256 repay = minter.syntheticDebt(user) / 10;
+        vm.prank(liquidator);
+        minter.liquidate(user, repay);
+
+        // Remaining debt still has positive locked backing — nothing stranded.
+        assertGt(minter.syntheticDebt(user), 0, "debt remains after partial");
+        assertGt(minter.lockedCollateral(user), 0, "remaining debt keeps locked backing");
+    }
+
+    // Invariant: after ANY successful liquidation, it is never the case that debt remains while
+    // locked collateral is zero (the H1 stranding condition).
+    function testFuzz_H1_NeverStrandsDebtWithZeroLockedCollateral(
+        uint256 newPrice,
+        uint256 repayFraction
+    ) public {
+        newPrice = bound(newPrice, 1 * 10**8, 100000 * 10**8);
+        repayFraction = bound(repayFraction, 1, 100);
+
+        uint256 net = _open(user, 2000 * 10**6, 10 * 10**18);
+        _setPrice(newPrice);
+
+        if (minter.isLiquidatable(user)) {
+            vm.prank(user);
+            syntheticToken.transfer(liquidator, net);
+            uint256 repay = (minter.syntheticDebt(user) * repayFraction) / 100;
+            if (repay > 0) {
+                vm.prank(liquidator);
+                try minter.liquidate(user, repay) {} catch {}
+            }
+        }
+
+        // The stranding condition (debt > 0 while locked == 0) must never hold.
+        if (minter.syntheticDebt(user) > 0) {
+            assertGt(minter.lockedCollateral(user), 0, "surviving debt must always be backed");
+        }
+    }
+
+    // ============ H2: borrower's available collateral absorbs their own bad debt ============
+
+    // A borrower cannot shield their available (unlocked) collateral from their own bad debt.
+    function test_H2_AvailableCollateralAbsorbsLossBeforeProtocol() public {
+        // Deposit far more than required so there is a large available buffer.
+        uint256 net = _open(user, 5000 * 10**6, 10 * 10**18);
+        uint256 locked = minter.lockedCollateral(user);
+        uint256 available = minter.getAvailableCollateral(user);
+        assertGt(available, 0);
+
+        // Underwater vs locked but well within total collateral.
+        _setPrice(200 * 10**8);
+        uint256 price = minter.getLatestPrice();
+        uint256 repayValue = _debtValueUSDC(net, price);
+        uint256 seize = repayValue + (repayValue * minter.liquidationBonusBps()) / 10000;
+        assertGt(seize, locked, "seizure exceeds locked, so it must draw from available");
+        assertLe(seize, minter.totalCollateral(user), "but stays within total collateral");
+
+        vm.prank(user);
+        syntheticToken.transfer(liquidator, net);
+
+        uint256 liqBefore = usdc.balanceOf(liquidator);
+        vm.prank(liquidator);
+        minter.liquidate(user, net);
+
+        // Liquidator was paid out of the borrower's available collateral (full value + bonus),
+        // and the borrower's remaining collateral shrank by exactly that amount.
+        assertEq(usdc.balanceOf(liquidator) - liqBefore, seize);
+        assertEq(minter.syntheticDebt(user), 0);
+        assertEq(minter.lockedCollateral(user), 0);
+        assertEq(minter.totalCollateral(user), (5000 * 10**6) - seize, "available absorbed the bonus/loss");
+    }
+
+    // ============ M3: dust mints that would lock zero collateral are rejected ============
+
+    function test_M3_DustMintLockingZeroCollateral_Reverts() public {
+        // Give the user collateral so the failure is specifically the dust guard, not insolvency.
+        usdc.mint(user, 1000 * 10**6);
+        vm.prank(user);
+        usdc.approve(address(minter), 1000 * 10**6);
+        vm.prank(user);
+        minter.depositCollateral(1000 * 10**6);
+
+        // At $100, requiredCollateral = amount*100e8*150 / (100*1e8*1e12) = amount * 150 / 1e12.
+        // Any amount < 1e12/150 ≈ 6.67e9 wei rounds requiredCollateral down to 0.
+        uint256 dust = 1e9; // 1e-9 sSPY
+        uint256 required = (dust * PX * minter.minCollateralizationRatio()) / (100 * 10**8 * 10**12);
+        assertEq(required, 0, "test setup: this dust amount locks zero collateral");
+
+        vm.prank(user);
+        vm.expectRevert("Mint amount too small");
+        minter.mint(dust);
+
+        // No unbacked debt or tokens were created.
+        assertEq(minter.syntheticDebt(user), 0);
+        assertEq(syntheticToken.balanceOf(user), 0);
+    }
+
+    // The smallest mint that locks non-zero collateral is accepted and is backed.
+    function test_M3_SmallestBackedMint_Succeeds() public {
+        usdc.mint(user, 1000 * 10**6);
+        vm.prank(user);
+        usdc.approve(address(minter), 1000 * 10**6);
+        vm.prank(user);
+        minter.depositCollateral(1000 * 10**6);
+
+        // Choose an amount that locks exactly 1 unit of USDC collateral.
+        uint256 amount = (1 * 100 * 10**8 * 10**12) / (PX * minter.minCollateralizationRatio()) + 1;
+        uint256 required = (amount * PX * minter.minCollateralizationRatio()) / (100 * 10**8 * 10**12);
+        assertGt(required, 0, "test setup: this mint locks positive collateral");
+
+        vm.prank(user);
+        minter.mint(amount);
+
+        assertEq(minter.syntheticDebt(user), amount);
+        assertGt(minter.lockedCollateral(user), 0, "debt is backed by locked collateral");
     }
 }

@@ -46,6 +46,7 @@ contract CollateralizationMonitor is IReceiver {
     error ZeroAddress();
     error ZeroMinRatio();
     error ReportTooShort();
+    error StaleTimestamp();
 
     modifier onlyOwner() {
         if (msg.sender != owner) revert NotOwner();
@@ -68,6 +69,11 @@ contract CollateralizationMonitor is IReceiver {
 
     /// @notice Writes a new collateralization snapshot. Restricted to the configured
     ///         forwarder so only DON-signed reports can mutate state.
+    /// @dev A timestamp ahead of the current block is CLAMPED to `block.timestamp` (the DON/data
+    ///      timestamp can run slightly ahead of chain time due to clock skew, and reverting would
+    ///      stall the feed); clamping still guarantees the stored timestamp is never in the future,
+    ///      so a consumer's staleness check can never underflow. Non-monotonic timestamps (a
+    ///      replayed/stale report overwriting fresher data) are rejected.
     function updateCollateral(
         uint256 _price,
         uint256 _reserves,
@@ -75,6 +81,10 @@ contract CollateralizationMonitor is IReceiver {
         uint256 _timestamp,
         bool _isHealthy
     ) public onlyForwarder {
+        if (_timestamp > block.timestamp) {
+            _timestamp = block.timestamp;
+        }
+        if (_timestamp < latestData.timestamp) revert StaleTimestamp();
         latestData = CollateralData({
             price: _price,
             reserves: _reserves,

@@ -11,6 +11,9 @@ contract CollateralizationMonitorTest is Test {
     address internal attacker = address(0xBAD);
 
     function setUp() public {
+        // Move to a realistic wall-clock time so reports carrying real Unix timestamps are not
+        // rejected as "future" by the new validation (Foundry's default block.timestamp is 1).
+        vm.warp(2_000_000_000);
         vm.prank(owner);
         monitor = new CollateralizationMonitor(forwarder);
     }
@@ -114,5 +117,49 @@ contract CollateralizationMonitorTest is Test {
         assertTrue(monitor.supportsInterface(type(IReceiver).interfaceId));
         assertTrue(monitor.supportsInterface(type(IERC165).interfaceId));
         assertFalse(monitor.supportsInterface(0xdeadbeef));
+    }
+
+    // ============ Report validation (M2) ============
+
+    /// @notice A future-dated timestamp is clamped to the current block rather than rejected, so
+    ///         DON/data clock skew cannot stall the feed; the stored timestamp is never in the
+    ///         future, so a consumer's staleness check can never underflow.
+    function test_UpdateCollateral_ClampsFutureTimestamp() public {
+        vm.prank(forwarder);
+        monitor.updateCollateral(100, 200, 150, block.timestamp + 1 days, true);
+        CollateralizationMonitor.CollateralData memory d = monitor.getLatestData();
+        assertEq(d.timestamp, block.timestamp, "future timestamp clamped to current block");
+    }
+
+    /// @notice A stale (older) report must not overwrite fresher health data (monotonic).
+    function test_UpdateCollateral_RevertsOnNonMonotonicTimestamp() public {
+        vm.startPrank(forwarder);
+        monitor.updateCollateral(100, 200, 150, block.timestamp - 10, true);
+        vm.expectRevert(CollateralizationMonitor.StaleTimestamp.selector);
+        monitor.updateCollateral(100, 200, 150, block.timestamp - 11, true);
+        vm.stopPrank();
+    }
+
+    /// @notice Current-block and newer timestamps are accepted.
+    function test_UpdateCollateral_AcceptsCurrentAndNewer() public {
+        vm.startPrank(forwarder);
+        monitor.updateCollateral(100, 200, 150, block.timestamp - 5, true);
+        monitor.updateCollateral(110, 210, 160, block.timestamp, true);
+        vm.stopPrank();
+        CollateralizationMonitor.CollateralData memory d = monitor.getLatestData();
+        assertEq(d.timestamp, block.timestamp);
+        assertEq(d.price, 110);
+    }
+
+    /// @notice onReport applies the same clamping as the direct setter.
+    function test_OnReport_ClampsFutureTimestamp() public {
+        bytes memory report = abi.encodePacked(
+            bytes4(keccak256("updateCollateral(uint256,uint256,uint256,uint256,bool)")),
+            abi.encode(uint256(100), uint256(200), uint256(150), block.timestamp + 1 days, true)
+        );
+        vm.prank(forwarder);
+        monitor.onReport("meta", report);
+        CollateralizationMonitor.CollateralData memory d = monitor.getLatestData();
+        assertEq(d.timestamp, block.timestamp, "future timestamp clamped via onReport");
     }
 }

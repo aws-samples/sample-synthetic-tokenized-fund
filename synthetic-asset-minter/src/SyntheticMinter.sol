@@ -382,6 +382,11 @@ contract SyntheticMinter is Ownable, Pausable, ReentrancyGuard {
         uint256 requiredCollateral = (syntheticAmount * price * minCollateralizationRatio)
             / (100 * 10**PRICE_DECIMALS * 10**(SYNTHETIC_DECIMALS - USDC_DECIMALS));
 
+        // A position must always lock a non-zero amount of collateral. Because `requiredCollateral`
+        // rounds down, a sufficiently small `syntheticAmount` would otherwise mint sSPY (and record
+        // debt) while locking zero USDC — i.e. unbacked debt. Reject such dust mints outright.
+        require(requiredCollateral > 0, "Mint amount too small");
+
         // Mint fee, charged in USDC on the minted notional value (same decimal adjustment).
         uint256 fee = (syntheticAmount * price * mintFeeBps)
             / (BPS_DENOMINATOR * 10**PRICE_DECIMALS * 10**(SYNTHETIC_DECIMALS - USDC_DECIMALS));
@@ -415,14 +420,24 @@ contract SyntheticMinter is Ownable, Pausable, ReentrancyGuard {
     ///      only reclaim the USDC they locked. Collateral is released in proportion to the
     ///      *tracked debt* repaid (`lockedCollateral * amount / debt`), which holds the
     ///      position's collateralization ratio constant at any price and stays solvent even if
-    ///      the caller transferred their sSPY away and reacquired it. The current price is
-    ///      validated (staleness) and emitted, but does not change the USDC released.
+    ///      the caller transferred their sSPY away and reacquired it. The price is read
+    ///      best-effort purely for the emitted event and does NOT change the USDC released:
+    ///      repaying debt and reclaiming collateral must never be blocked by a stale or unset
+    ///      oracle, or a user's funds could be trapped indefinitely.
     /// @param syntheticAmount Amount of synthetic tokens to burn/repay (18 decimals)
     function burn(uint256 syntheticAmount) external nonReentrant whenNotPaused {
         require(syntheticAmount > 0, "Amount must be greater than zero");
 
-        // Validate price feed and get current price (staleness enforced)
-        uint256 price = _validatePriceFeed();
+        // Read the current price best-effort for the event only — staleness is intentionally NOT
+        // enforced here because burning is price-independent debt repayment (see @dev above).
+        uint256 price = 0;
+        if (address(priceFeed) != address(0)) {
+            try priceFeed.getLatestPrice() returns (uint256 p, uint256) {
+                price = p;
+            } catch {
+                // Feed call reverted; leave price at 0 for the event.
+            }
+        }
 
         // Caller must hold the tokens they are burning...
         uint256 userBalance = syntheticToken.balanceOf(msg.sender);
@@ -451,14 +466,20 @@ contract SyntheticMinter is Ownable, Pausable, ReentrancyGuard {
 
     /// @notice Liquidates an unhealthy position by repaying part or all of its sSPY debt.
     /// @dev The liquidator burns their own sSPY to repay `repayAmount` of `user`'s debt and, in
-    ///      return, seizes collateral equal to the USDC value of the repaid debt plus a bonus,
-    ///      capped at the position's locked collateral. Only permitted once the position's
-    ///      oracle-priced collateralization ratio falls strictly below `liquidationThreshold`.
-    ///      Fully repaying the debt closes the position and returns any collateral remaining
-    ///      after the seizure to the borrower's available balance. If the seized collateral
-    ///      cannot cover the repaid debt value (extreme price gap), the shortfall is surfaced via
-    ///      {BadDebtRealized} rather than being hidden — the contract never pays out more USDC
-    ///      than the position actually holds.
+    ///      return, seizes collateral equal to the USDC value of the repaid debt plus a bonus. The
+    ///      seizure is taken from the borrower's locked collateral first and, if that is
+    ///      insufficient, from their available collateral — capped at the borrower's TOTAL
+    ///      collateral, so their own funds absorb their loss before the protocol does. Only
+    ///      permitted once the position's oracle-priced collateralization ratio falls strictly
+    ///      below `liquidationThreshold`. A liquidation whose seizure would consume all of the
+    ///      locked collateral must fully repay the debt (`newDebt == 0`), so no un-repaid,
+    ///      under-collateralized remainder is ever left stranded; smaller partial repayments that
+    ///      stay within the locked collateral are always allowed. Fully repaying the debt closes
+    ///      the position and returns any collateral remaining after the seizure to the borrower's
+    ///      available balance. If the seized collateral cannot cover the repaid debt value (extreme
+    ///      price gap that exceeds even the borrower's total collateral), the shortfall is surfaced
+    ///      via {BadDebtRealized} rather than hidden — the contract never pays out more USDC than
+    ///      the position actually holds.
     /// @param user The owner of the position being liquidated
     /// @param repayAmount Amount of sSPY debt to repay on the user's behalf (18 decimals)
     function liquidate(address user, uint256 repayAmount) external nonReentrant whenNotPaused {
@@ -484,23 +505,40 @@ contract SyntheticMinter is Ownable, Pausable, ReentrancyGuard {
         // Liquidator must hold the sSPY they are repaying.
         require(syntheticToken.balanceOf(msg.sender) >= repayAmount, "Insufficient balance");
 
-        // Collateral to seize = repaid debt value + bonus, capped at the position's locked collateral.
+        uint256 totalBefore = totalCollateral[user];
+
+        // Collateral to seize = repaid debt value + bonus. A defaulting borrower's OWN collateral
+        // must absorb their loss before the protocol does, so the seizure draws from locked
+        // collateral first and then from the borrower's available collateral — capped at everything
+        // they hold (not just the locked portion). This closes the leak where an underwater
+        // borrower kept their available deposit while the protocol ate the bad debt.
         uint256 repayValue = _debtValueUSDC(repayAmount, price);
         uint256 seize = repayValue + (repayValue * liquidationBonusBps) / BPS_DENOMINATOR;
-        uint256 shortfall = 0;
-        if (seize > lockedBefore) {
-            seize = lockedBefore;
-            if (repayValue > lockedBefore) {
-                // Even the principal (excluding bonus) exceeds available collateral: bad debt.
-                shortfall = repayValue - lockedBefore;
-            }
+        if (seize > totalBefore) {
+            seize = totalBefore;
         }
 
-        // ---- Effects ----
         uint256 newDebt = debt - repayAmount;
+
+        // Dipping past the locked collateral (into the borrower's available balance) is only
+        // coherent when the debt is fully cleared. A *partial* liquidation that consumed all of the
+        // locked collateral would leave the un-repaid remainder wholly unbacked and — because
+        // available stays withdrawable — silently strand it. Force such liquidations to fully close
+        // the position; a liquidator who cannot do so can repay a smaller amount that stays within
+        // the locked collateral (which always leaves the remaining debt backed).
+        if (seize >= lockedBefore) {
+            require(newDebt == 0, "Must fully close underwater position");
+        }
+
+        // With the guard above, any surviving debt (newDebt > 0) is guaranteed to still be backed
+        // by a positive `lockedBefore - seize`, so bad debt can only arise on a full close: when the
+        // seized collateral cannot even cover the repaid debt value.
+        uint256 shortfall = repayValue > seize ? repayValue - seize : 0;
+
+        // ---- Effects ----
         syntheticDebt[user] = newDebt;
         totalSyntheticDebt -= repayAmount;
-        totalCollateral[user] -= seize;
+        totalCollateral[user] = totalBefore - seize;
 
         if (newDebt == 0) {
             // Position fully closed: unlock any collateral left after the seizure back to the
@@ -508,6 +546,7 @@ contract SyntheticMinter is Ownable, Pausable, ReentrancyGuard {
             totalLockedCollateral -= lockedBefore;
             lockedCollateral[user] = 0;
         } else {
+            // seize < lockedBefore here, so the remaining debt keeps positive locked backing.
             lockedCollateral[user] = lockedBefore - seize;
             totalLockedCollateral -= seize;
         }
