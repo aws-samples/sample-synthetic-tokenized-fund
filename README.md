@@ -31,9 +31,13 @@ Here, synthetic means sSPY provides price exposure to the ETF without holding th
 
 ## How It Works
 
-1. **AWS backend** — Lambda fetches SPY prices from Finnhub/Alpha Vantage, caches them in DynamoDB, and serves them via an API-key-protected API Gateway.
-2. **CRE workflow** (every 30s) — reads the price from Lambda and collateral/supply from the contracts, computes the collateralization ratio, then writes price + health back on-chain through DON consensus.
-3. **Users** — deposit USDC into SyntheticMinter to mint sSPY (150% collateralized), and burn sSPY to unlock their collateral.
+- **AWS backend** — Lambda fetches SPY prices from Finnhub/Alpha Vantage, caches them in DynamoDB, and serves them via an API-key-protected API Gateway.
+- **CRE workflow** (every 30s) — reads the price from Lambda and collateral/supply from the contracts, computes the collateralization ratio, then writes price + health back on-chain through DON consensus.
+- **Users** — deposit USDC into `SyntheticMinter` to mint sSPY (150% collateralized), and burn sSPY to unlock their collateral.
+
+### Smart Contracts
+
+The on-chain layer includes `SyntheticMinter`, `SyntheticToken`, `PriceFeed`, and `CollateralizationMonitor`. `SyntheticMinter` manages USDC collateral, sSPY debt, minting, burning, and liquidation. Before minting, it reads the CRE-updated price and health contracts to enforce protocol policy.
 
 ## Protocol Economics
 
